@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/alecthomas/kong"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -14,17 +15,51 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
+var CLI struct {
+	Serialize struct {
+		BlockDir  string `arg:"" help:"Directory containing the block to serialize." required:""`
+		OutputDir string `arg:"" help:"Directory to write the serialized protobuf files to." required:""`
+	} `cmd:"serialize" help:"Serialize a set of blocks to protobuf files."`
+}
+
 func main() {
-	files, err := os.ReadDir("data")
+	ctx := kong.Parse(&CLI)
+
+	switch ctx.Command() {
+	case "serialize <block-dir> <output-dir>":
+		err := serialize(CLI.Serialize.BlockDir, CLI.Serialize.OutputDir)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+	default:
+		fmt.Println("Invalid command: ", ctx.Command())
+		os.Exit(1)
+	}
+}
+
+func serialize(dataDir, outputDir string) error {
+	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+		if err := os.Mkdir(outputDir, 0755); err != nil {
+			return fmt.Errorf("error creating output directory: %w", err)
+		}
+	}
+
+	files, err := os.ReadDir(dataDir)
 	if err != nil {
 		panic(err)
 	}
 
 	for _, file := range files {
+		if !file.IsDir() || len(file.Name()) != 26 {
+			continue
+		}
+
 		fmt.Println("Scanning file: ", file.Name())
-		metas, vals, err := handleBlock("data/" + file.Name())
+		metas, vals, err := handleBlock(dataDir + "/" + file.Name())
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("error handling block: %w", err)
 		}
 
 		write := prompb.WriteRequest{
@@ -34,21 +69,23 @@ func main() {
 
 		data, err := write.Marshal()
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("error marshalling write request: %w", err)
 		}
 
-		f, err := os.Create("output/" + file.Name() + ".pb")
+		f, err := os.Create(outputDir + "/" + file.Name() + ".pb")
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("error creating file: %w", err)
 		}
 
 		defer f.Close()
 
 		_, err = f.Write(data)
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("error writing data to file: %w", err)
 		}
 	}
+
+	return nil
 }
 
 func handleBlock(blockPath string) ([]prompb.MetricMetadata, []prompb.TimeSeries, error) {
