@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
 	"github.com/alecthomas/kong"
+	"github.com/golang/snappy"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -20,6 +23,10 @@ var CLI struct {
 		BlockDir  string `arg:"" help:"Directory containing the block to serialize." required:""`
 		OutputDir string `arg:"" help:"Directory to write the serialized protobuf files to." required:""`
 	} `cmd:"serialize" help:"Serialize a set of blocks to protobuf files."`
+	Replay struct {
+		InputDir       string `arg:"" help:"Directory containing the protobuf files to replay." required:""`
+		OutputEndpoint string `arg:"" help:"Endpoint to send the replayed data to." required:""`
+	} `cmd:"replay" help:"Replay a set of protobuf files to a remote endpoint."`
 }
 
 func main() {
@@ -32,11 +39,64 @@ func main() {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-
+	case "replay <input-dir> <output-endpoint>":
+		if err := replay(CLI.Replay.InputDir, CLI.Replay.OutputEndpoint); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Println("Invalid command: ", ctx.Command())
 		os.Exit(1)
 	}
+}
+
+func replay(inputDir, outputEndpoint string) error {
+	files, err := os.ReadDir(inputDir)
+	if err != nil {
+		return fmt.Errorf("error reading input directory: %w", err)
+	}
+
+	fmt.Println("Replaying to endpoint: ", outputEndpoint)
+
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".pb") {
+			continue
+		}
+
+		fmt.Println("Replaying file: ", file.Name())
+		data, err := os.ReadFile(inputDir + "/" + file.Name())
+		if err != nil {
+			return fmt.Errorf("error reading file: %w", err)
+		}
+
+		data = snappy.Encode(nil, data)
+
+		request, err := http.NewRequest(http.MethodPost, outputEndpoint, bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("error creating request: %w", err)
+		}
+
+		request.Header.Set("Content-Type", "application/x-protobuf")
+		request.Header.Set("Content-Encoding", "snappy")
+
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return fmt.Errorf("error sending data to endpoint: %w", err)
+		}
+
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			body := bytes.Buffer{}
+			_, err := body.ReadFrom(resp.Body)
+			if err != nil {
+				return fmt.Errorf("error reading response body: %w", err)
+			}
+
+			return fmt.Errorf("error response from endpoint: %d: %s", resp.StatusCode, body.String())
+		}
+	}
+
+	return nil
 }
 
 func serialize(dataDir, outputDir string) error {
@@ -169,6 +229,8 @@ func handleBlock(blockPath string) ([]prompb.MetricMetadata, []prompb.TimeSeries
 	for k, v := range batch {
 		series = append(series, prompb.TimeSeries{Labels: labelMap[k], Samples: v})
 	}
+
+	fmt.Println("Found", len(series))
 
 	meta := []prompb.MetricMetadata{}
 	for _, v := range metas {
